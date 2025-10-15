@@ -266,15 +266,24 @@ def scanner_loop():
         time.sleep(delay)
 
 # ===================== Flask 헬스체크 =====================
+import threading
+import os
+import time
+from flask import Flask, jsonify
+
 app = Flask(__name__)
 start_time = time.time()
 
 @app.route("/")
-def root(): return "OK", 200
+def root():
+    return "OK", 200
 
 @app.route("/healthz")
 def healthz():
-    return jsonify({"status":"ok","uptime_sec": int(time.time()-start_time)}), 200
+    return jsonify({
+        "status": "ok",
+        "uptime_sec": int(time.time() - start_time)
+    }), 200
 
 def main():
     t = threading.Thread(target=scanner_loop, daemon=True)
@@ -284,3 +293,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
