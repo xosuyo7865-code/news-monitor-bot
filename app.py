@@ -27,8 +27,10 @@ app.logger.setLevel(logging.INFO)
 
 # -------------------- RSS 소스 --------------------
 RSS_FEEDS = [
-    "https://www.prnewswire.com/rss/",
-    "https://www.globenewswire.com/rss/list",
+    # PR Newswire 전체
+    "https://www.prnewswire.com/rss/news-releases-list.rss",
+    # GlobeNewswire 북미 전체
+    "https://www.globenewswire.com/RssFeed/region/North%20America/feedTitle/GlobeNewswire%20-%20North%20America%20News"
 ]
 
 # -------------------- 키워드 --------------------
@@ -48,6 +50,7 @@ launches|introduces|announces\ new|releases|unveil\w*|debuts|rolls\ out|solution
 \bELOC\b|equity\ line\ of\ credit|standby\ equity\ purchase|
 strategic\ investment|equity\ investment|takes\ stake|
 purchase\ agreement|asset\ purchase|stock\ purchase|
+license\ agreement|licensing\ agreement|licensing\ (deal|contract|partnership)|exclusive\ license|non[-\ ]exclusive\ license|license\ rights|licensing\ rights|
 share\ repurchase|buyback|repurchase\ program|authorization\ to\ repurchase|
 in\ discussions\ to\ acquire|exploring\ acquisition|preliminary\ discussions|
 enters\ into\ definitive\ agreement|merger\ agreement|acquisition\ agreement|
@@ -76,6 +79,7 @@ CATEGORIES = [
   ("mna_negotiation", r"enters into definitive agreement|merger agreement|acquisition agreement"),
   ("land_use_permit", r"land use permit|\bLUP\b|conditional use permit|\bCUP\b|zoning approval"),
   ("federal_funding", r"federal funding|federal award|US federal|grant award|contract award"),
+  ("license_agreement", r"license agreement|licensing agreement|licensing (deal|contract|partnership)|exclusive license|non[- ]exclusive license|license rights|licensing rights"),
 ]
 def classify(text):
     for label, pat in CATEGORIES:
@@ -315,3 +319,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
