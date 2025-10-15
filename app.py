@@ -157,6 +157,13 @@ def save_json_dict(path, d):
 def hash_uid(url, title):
     return hashlib.sha256((url + "||" + title).encode("utf-8")).hexdigest()[:16]
 
+from urllib.parse import urlparse
+
+def clean_url(u: str) -> str:
+    """쿼리스트링, 트래킹 파라미터를 제거해서 URL을 정규화"""
+    p = urlparse(u)
+    return f"{p.scheme}://{p.netloc}{p.path}"
+
 def ny_kst_label(struct_time_or_none):
     if struct_time_or_none:
         dt_utc = datetime.datetime(*struct_time_or_none[:6], tzinfo=ZoneInfo("UTC"))
@@ -267,14 +274,21 @@ def run_once():
         feed = feedparser.parse(feed_url)
         app.logger.info(f"📰 entries: {len(feed.entries)}")
 
-        for e in feed.entries[:80]:
-            url = getattr(e, "link", "")
-            title = getattr(e, "title", "") or ""
-            summary = getattr(e, "summary", "") or ""
-            guid = getattr(e, "id", "") or hash_uid(url, title)
+for e in feed.entries[:80]:
+    url = getattr(e, "link", "") or ""
+    title = getattr(e, "title", "") or ""
+    summary = getattr(e, "summary", "") or ""
 
-            if guid in seen:
-                continue
+    if not url:
+        continue  # URL 없으면 스킵
+
+    # URL 기반으로 GUID 생성 (중복 방지 효과 ↑)
+    guid = hashlib.sha256(clean_url(url).encode()).hexdigest()[:16]
+
+    if guid in seen:
+        continue
+    # ... (매칭/요약/디스코드 푸시 등 나머지 로직)
+    seen.add(guid)
 
             hay = f"{title} {summary}"
             if not KEYWORDS.search(hay):
@@ -344,5 +358,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
