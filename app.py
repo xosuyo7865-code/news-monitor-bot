@@ -96,25 +96,36 @@ use_sheets = bool(GSHEET_KEY and GOOGLE_SERVICE_ACCOUNT_JSON)
 
 # ✅ [NEW] 환경변수에서 JSON / Base64 / 파일 경로 모두 지원
 def _load_sa_json(raw: str):
-    import base64
+    import base64, json, os
     if not raw:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is empty")
-    # 1) JSON 문자열 시도
+
+    # 1) 정상 JSON 또는 "문자열 안의 JSON"
     try:
-        return json.loads(raw)
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, str):
+            return json.loads(obj)
     except Exception:
         pass
-    # 2) Base64 → JSON 시도
+
+    # 2) Base64 → JSON
     try:
-        decoded = base64.b64decode(raw).decode("utf-8")
-        return json.loads(decoded)
+        dec = base64.b64decode(raw).decode("utf-8")
+        obj = json.loads(dec)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
         pass
-    # 3) 파일 경로 시도
+
+    # 3) 파일 경로
     if os.path.isfile(raw):
         with open(raw, "r") as f:
             return json.load(f)
+
     raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON must be a JSON string, base64-encoded JSON, or a file path")
+
 
 if use_sheets:
     import gspread
@@ -357,6 +368,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
