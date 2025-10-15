@@ -268,26 +268,27 @@ def run_once():
         feed = feedparser.parse(feed_url)
         app.logger.info(f"📰 entries: {len(feed.entries)}")
 
-    for e in feed.entries[:80]:
-        url = getattr(e, "link", "") or ""
-        if not url:
-           continue
+        for e in feed.entries[:80]:
+            url = getattr(e, "link", "") or ""
+            if not url:
+                continue
 
-    guid = hashlib.sha256(clean_url(url).encode()).hexdigest()[:16]
-    if guid in seen:
-        continue
+            # URL 정규화 후 GUID 생성
+            guid = hashlib.sha256(clean_url(url).encode()).hexdigest()[:16]
+            if guid in seen:
+                continue
 
-    seen.add(guid)                      # ✅ 중복 체크 즉시 등록
-    save_json_set(SEEN_FILE, seen)      # ✅ 안전하게 즉시 저장
+            # 먼저 본 것으로 표시(중복 방지) + 즉시 저장
+            seen.add(guid)
+            save_json_set(SEEN_FILE, seen)
 
-    title = getattr(e, "title", "") or ""
-    summary = getattr(e, "summary", "") or ""
-    hay = f"{title} {summary}"
-    if not KEYWORDS.search(hay):
-        continue
+            title = getattr(e, "title", "") or ""
+            summary = getattr(e, "summary", "") or ""
+            hay = f"{title} {summary}"
 
-    # 이하 GPT 요약, 디스코드 전송 로직 그대로...
-
+            # 키워드 매칭 실패 시 스킵
+            if not KEYWORDS.search(hay):
+                continue
 
             app.logger.info(f"✅ MATCH: {title[:120]}...")
 
@@ -317,9 +318,6 @@ def run_once():
             ]
             append_sheet(row)
             app.logger.info("🧾 appended to Sheet (if enabled)")
-
-            # ✅ 여기서 단 한 번만 seen에 추가
-            seen.add(guid)
 
     save_json_set(SEEN_FILE, seen)
     save_json_dict(SECTOR_CACHE_FILE, sector_cache)
@@ -359,6 +357,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
