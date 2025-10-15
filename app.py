@@ -93,12 +93,36 @@ JITTER_MIN, JITTER_MAX = 35, 50
 
 # -------------------- 선택적: Google Sheets --------------------
 use_sheets = bool(GSHEET_KEY and GOOGLE_SERVICE_ACCOUNT_JSON)
+
+# ✅ [NEW] 환경변수에서 JSON / Base64 / 파일 경로 모두 지원
+def _load_sa_json(raw: str):
+    import base64
+    if not raw:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is empty")
+    # 1) JSON 문자열 시도
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    # 2) Base64 → JSON 시도
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+        return json.loads(decoded)
+    except Exception:
+        pass
+    # 3) 파일 경로 시도
+    if os.path.isfile(raw):
+        with open(raw, "r") as f:
+            return json.load(f)
+    raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON must be a JSON string, base64-encoded JSON, or a file path")
+
 if use_sheets:
     import gspread
     from google.oauth2.service_account import Credentials
+
     def append_sheet(row):
         creds = Credentials.from_service_account_info(
-            json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
+            _load_sa_json(GOOGLE_SERVICE_ACCOUNT_JSON),
             scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
         gc = gspread.authorize(creds)
@@ -111,6 +135,7 @@ if use_sheets:
 else:
     def append_sheet(row):
         return
+
 
 # -------------------- 유틸 --------------------
 def load_json_set(path):
@@ -319,4 +344,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
