@@ -268,22 +268,26 @@ def run_once():
         feed = feedparser.parse(feed_url)
         app.logger.info(f"📰 entries: {len(feed.entries)}")
 
-        for e in feed.entries[:80]:
-            url = getattr(e, "link", "") or ""
-            title = getattr(e, "title", "") or ""
-            summary = getattr(e, "summary", "") or ""
+    for e in feed.entries[:80]:
+        url = getattr(e, "link", "") or ""
+        if not url:
+           continue
 
-            if not url:
-                continue  # URL 없으면 스킵
+    guid = hashlib.sha256(clean_url(url).encode()).hexdigest()[:16]
+    if guid in seen:
+        continue
 
-            # URL 기반 GUID (쿼리 제거)
-            guid = hashlib.sha256(clean_url(url).encode()).hexdigest()[:16]
-            if guid in seen:
-                continue
+    seen.add(guid)                      # ✅ 중복 체크 즉시 등록
+    save_json_set(SEEN_FILE, seen)      # ✅ 안전하게 즉시 저장
 
-            hay = f"{title} {summary}"
-            if not KEYWORDS.search(hay):
-                continue
+    title = getattr(e, "title", "") or ""
+    summary = getattr(e, "summary", "") or ""
+    hay = f"{title} {summary}"
+    if not KEYWORDS.search(hay):
+        continue
+
+    # 이하 GPT 요약, 디스코드 전송 로직 그대로...
+
 
             app.logger.info(f"✅ MATCH: {title[:120]}...")
 
@@ -355,6 +359,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
