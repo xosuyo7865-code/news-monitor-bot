@@ -359,6 +359,18 @@ def root():
 def healthz():
     return jsonify({"status":"ok","uptime_sec": int(time.time()-start_time)}), 200
 
+# ✅ 진단용 시트 테스트 엔드포인트
+@app.route("/_sheet_test")
+def sheet_test():
+    try:
+        now = datetime.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
+        append_sheet(["__TEST__", now, "write-from-app", "", "", "", "", "", "", "", ""])
+        return "sheet append ok", 200
+    except Exception as e:
+        app.logger.error(f"[sheets] manual test failed: {e}")
+        return f"sheet append failed: {e}", 500
+
+
 def main():
     t = threading.Thread(target=scanner_loop, daemon=True)
     t.start()
@@ -368,6 +380,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
