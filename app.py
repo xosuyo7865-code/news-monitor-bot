@@ -256,12 +256,6 @@ def push_discord(payload):
     except Exception as e:
         app.logger.error(f"[discord] push error: {e}")
 
-# -------------------- 분류 --------------------
-def classify(text):
-    for label, pat in CATEGORIES:
-        if re.search(pat, text, re.I): return label
-    return "other"
-
 # -------------------- 스캔 1회 --------------------
 def run_once():
     app.logger.info("🔎 run_once: start")
@@ -274,21 +268,18 @@ def run_once():
         feed = feedparser.parse(feed_url)
         app.logger.info(f"📰 entries: {len(feed.entries)}")
 
-for e in feed.entries[:80]:
-    url = getattr(e, "link", "") or ""
-    title = getattr(e, "title", "") or ""
-    summary = getattr(e, "summary", "") or ""
+        for e in feed.entries[:80]:
+            url = getattr(e, "link", "") or ""
+            title = getattr(e, "title", "") or ""
+            summary = getattr(e, "summary", "") or ""
 
-    if not url:
-        continue  # URL 없으면 스킵
+            if not url:
+                continue  # URL 없으면 스킵
 
-    # URL 기반으로 GUID 생성 (중복 방지 효과 ↑)
-    guid = hashlib.sha256(clean_url(url).encode()).hexdigest()[:16]
-
-    if guid in seen:
-        continue
-    # ... (매칭/요약/디스코드 푸시 등 나머지 로직)
-    seen.add(guid)
+            # URL 기반 GUID (쿼리 제거)
+            guid = hashlib.sha256(clean_url(url).encode()).hexdigest()[:16]
+            if guid in seen:
+                continue
 
             hay = f"{title} {summary}"
             if not KEYWORDS.search(hay):
@@ -296,7 +287,9 @@ for e in feed.entries[:80]:
 
             app.logger.info(f"✅ MATCH: {title[:120]}...")
 
-            article_time = ny_kst_label(getattr(e,"published_parsed", None) or getattr(e,"updated_parsed", None))
+            article_time = ny_kst_label(
+                getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
+            )
             cat = classify(hay)
             ticker = extract_ticker(hay)
             company = extract_company(title) or extract_company(summary)
@@ -313,17 +306,21 @@ for e in feed.entries[:80]:
             app.logger.info("📤 pushed to Discord")
 
             # 시트 기록(옵션)
-            row = [now_kst, feed_url.split('/')[2], guid,
-                   ticker or "", company or "", sector, cat,
-                   title, article_time, ko, url]
+            row = [
+                now_kst, feed_url.split('/')[2], guid,
+                ticker or "", company or "", sector, cat,
+                title, article_time, ko, url
+            ]
             append_sheet(row)
             app.logger.info("🧾 appended to Sheet (if enabled)")
 
+            # ✅ 여기서 단 한 번만 seen에 추가
             seen.add(guid)
 
     save_json_set(SEEN_FILE, seen)
     save_json_dict(SECTOR_CACHE_FILE, sector_cache)
     app.logger.info("🔎 run_once: done")
+
 
 # -------------------- 백그라운드 루프 --------------------
 stop_event = threading.Event()
@@ -358,6 +355,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
