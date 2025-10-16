@@ -230,9 +230,11 @@ def get_sector_with_cache(ticker, cache):
 # -------------------- GPT 요약(→한국어) --------------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 def summarize_ko(text):
-    prompt = (
-        "Summarize the press release in 2–3 concise sentences and translate the summary into Korean. "
-        "Keep company/product names as-is.\n\nTEXT:\n" + (text or "")[:2000]
+prompt = (
+    "다음 보도자료를 2~3문장으로 한국어로만 요약해줘. "
+    "회사명, 제품명, 기관명은 영어 그대로 유지하고 불필요한 해석은 하지 마.\n\nTEXT:\n" + (text or "")[:2000]
+)
+
     )
     r = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -393,6 +395,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
