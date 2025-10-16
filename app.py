@@ -1,15 +1,17 @@
 # app.py — Newswire Scanner (PRNewswire + GlobeNewswire)
 # - 35–50s jitter loop
 # - Keyword filtering
-# - GPT 요약→한국어 번역
+# - GPT 한국어 요약 (영문 제거)
 # - Discord Webhook 푸시
 # - (옵션) Google Sheets 로그
 # - Sector 캐시 (yfinance)
 # - /healthz 헬스체크
-# - 상세 로그 출력 (Render 콘솔에서 확인)
+# - 중복 방지: Redis(권장) + 로컬 폴백
+# - 상세 로그
 
-import os, re, time, json, hashlib, requests, feedparser, datetime, threading, random, logging
+import os, re, time, json, hashlib, requests, feedparser, datetime, threading, random, logging, socket
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 from openai import OpenAI
 from flask import Flask, jsonify
 import yfinance as yf
@@ -19,18 +21,19 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 GSHEET_KEY = os.getenv("GSHEET_KEY")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+REDIS_URL = os.getenv("REDIS_URL")  # ex) rediss://:password@host:port (없으면 로컬 폴백)
+INSTANCE = socket.gethostname()
 
 # -------------------- 앱/로거 --------------------
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 app.logger.setLevel(logging.INFO)
+app.logger.info(f"🧭 instance={INSTANCE} | use_redis={'yes' if REDIS_URL else 'no'}")
 
 # -------------------- RSS 소스 --------------------
 RSS_FEEDS = [
-    # PR Newswire 전체
-    "https://www.prnewswire.com/rss/news-releases-list.rss",
-    # GlobeNewswire 북미 전체
-    "https://www.globenewswire.com/RssFeed/region/North%20America/feedTitle/GlobeNewswire%20-%20North%20America%20News"
+    "https://www.prnewswire.com/rss/news-releases-list.rss",  # PR Newswire 전체
+    "https://www.globenewswire.com/RssFeed/country/United%20States/feedTitle/GlobeNewswire%20-%20News%20from%20United%20States"
 ]
 
 # -------------------- 키워드 --------------------
@@ -94,38 +97,26 @@ JITTER_MIN, JITTER_MAX = 35, 50
 # -------------------- 선택적: Google Sheets --------------------
 use_sheets = bool(GSHEET_KEY and GOOGLE_SERVICE_ACCOUNT_JSON)
 
-# ✅ [NEW] 환경변수에서 JSON / Base64 / 파일 경로 모두 지원
 def _load_sa_json(raw: str):
     import base64, json, os
     if not raw:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is empty")
-
-    # 1) 정상 JSON 또는 "문자열 안의 JSON"
     try:
         obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
-        if isinstance(obj, str):
-            return json.loads(obj)
+        if isinstance(obj, dict): return obj
+        if isinstance(obj, str): return json.loads(obj)
     except Exception:
         pass
-
-    # 2) Base64 → JSON
     try:
         dec = base64.b64decode(raw).decode("utf-8")
         obj = json.loads(dec)
-        if isinstance(obj, dict):
-            return obj
+        if isinstance(obj, dict): return obj
     except Exception:
         pass
-
-    # 3) 파일 경로
     if os.path.isfile(raw):
         with open(raw, "r") as f:
             return json.load(f)
-
     raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON must be a JSON string, base64-encoded JSON, or a file path")
-
 
 if use_sheets:
     import gspread
@@ -147,7 +138,6 @@ else:
     def append_sheet(row):
         return
 
-
 # -------------------- 유틸 --------------------
 def load_json_set(path):
     if os.path.exists(path):
@@ -168,10 +158,7 @@ def save_json_dict(path, d):
 def hash_uid(url, title):
     return hashlib.sha256((url + "||" + title).encode("utf-8")).hexdigest()[:16]
 
-from urllib.parse import urlparse
-
 def clean_url(u: str) -> str:
-    """쿼리스트링, 트래킹 파라미터를 제거해서 URL을 정규화"""
     p = urlparse(u)
     return f"{p.scheme}://{p.netloc}{p.path}"
 
@@ -267,11 +254,76 @@ def push_discord(payload):
     except Exception as e:
         app.logger.error(f"[discord] push error: {e}")
 
-# -------------------- 스캔 1회 --------------------
+# -------------------- Dedup Store (Redis or local) --------------------
+try:
+    import redis  # render의 이미지에 없으면 ImportError → 자동 폴백
+except Exception:
+    redis = None
+
+_rds = None
+def _get_redis():
+    global _rds
+    if _rds is None and REDIS_URL and redis:
+        try:
+            _rds = redis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+                ssl=True if REDIS_URL.startswith("rediss://") else None
+            )
+            app.logger.info("[dedup] Redis connected")
+        except Exception as e:
+            app.logger.error(f"[dedup] Redis connect failed: {e}")
+            _rds = None
+    return _rds
+
+def _normalize_title(title: str) -> str:
+    t = (title or "").lower()
+    t = re.sub(r"[\W_]+", " ", t)     # 특수문자 제거
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def seen_check_and_set_url(guid: str, ttl_seconds: int = 14*24*3600) -> bool:
+    """
+    URL GUID 기준 체크. True → 이미 봄 / False → 처음 봄(마킹 성공)
+    """
+    r = _get_redis()
+    if r:
+        key = f"nwscanner:seen:url:{guid}"
+        try:
+            ok = r.setnx(key, INSTANCE)  # race-free
+            if ok: r.expire(key, ttl_seconds)
+            return not ok
+        except Exception as e:
+            app.logger.error(f"[dedup] Redis error(url): {e}")
+    # 폴백: 로컬 파일 세트
+    seen = load_json_set(SEEN_FILE)
+    if guid in seen: return True
+    seen.add(guid); save_json_set(SEEN_FILE, seen)
+    return False
+
+def seen_set_title_once(title: str, ttl_seconds: int = 14*24*3600) -> bool:
+    """
+    제목 기반 보조 차단. 이미 있으면 True, 없으면 set 후 False.
+    (URL이 달라도 같은 제목이면 차단)
+    """
+    norm = _normalize_title(title)
+    if not norm: return False
+    r = _get_redis()
+    if r:
+        key = f"nwscanner:seen:title:{hashlib.sha256(norm.encode()).hexdigest()[:16]}"
+        try:
+            ok = r.setnx(key, INSTANCE)
+            if ok: r.expire(key, ttl_seconds)
+            return not ok
+        except Exception as e:
+            app.logger.error(f"[dedup] Redis error(title): {e}")
+            return False
+    # 로컬 폴백은 URL 세트와 충돌 우려로 생략 (Redis 권장)
+    return False
+
 # -------------------- 스캔 1회 --------------------
 def run_once():
     app.logger.info("🔎 run_once: start")
-    seen = load_json_set(SEEN_FILE)
     sector_cache = load_json_dict(SECTOR_CACHE_FILE)
     now_kst = datetime.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -286,23 +338,25 @@ def run_once():
                 app.logger.info("⚠️  entry skipped: no URL")
                 continue
 
-            # ✅ URL 정규화 후 GUID 생성
-            guid = hashlib.sha256(clean_url(url).encode()).hexdigest()[:16]
-            if guid in seen:
-                app.logger.info(f"⏩ already seen: {guid}")
-                continue
+            clean = clean_url(url)
+            guid = hashlib.sha256(clean.encode()).hexdigest()[:16]
 
-            # ✅ 중복 방지: 가장 먼저 등록
-            seen.add(guid)
-            save_json_set(SEEN_FILE, seen)
+            # ✅ 1차: URL 기준 중앙 중복 차단 (즉시)
+            if seen_check_and_set_url(guid):
+                app.logger.info(f"⏩ already seen(url): {guid}")
+                continue
 
             title = getattr(e, "title", "") or ""
             summary = getattr(e, "summary", "") or ""
             hay = f"{title} {summary}"
 
-            # ✅ 키워드 매칭 실패 로그
             if not KEYWORDS.search(hay):
                 app.logger.info(f"❌ no match: {title[:100]}...")
+                continue
+
+            # ✅ 2차: 제목 기반 보조 차단 (서로 다른 URL이라도 같은 기사면 차단)
+            if seen_set_title_once(title):
+                app.logger.info(f"⏩ already seen(title): {title[:80]}…")
                 continue
 
             app.logger.info(f"✅ MATCH: {title[:120]}...")
@@ -315,38 +369,30 @@ def run_once():
             company = extract_company(title) or extract_company(summary)
             sector = get_sector_with_cache(ticker, sector_cache)
 
-            # ✅ GPT 요약
             try:
                 ko = summarize_ko(summary if summary else title)
             except Exception as ex:
                 ko = "(요약 실패) " + (summary[:200] or title)
                 app.logger.error(f"[gpt] error: {ex}")
 
-            # ✅ 디스코드 전송
             payload = discord_embed(cat, title, url, ticker, company, sector, article_time, ko)
             push_discord(payload)
             app.logger.info("📤 pushed to Discord")
 
-            # ✅ Google Sheets 기록 (강화된 로깅)
+            # Google Sheets 기록
             row = [
                 now_kst, feed_url.split('/')[2], guid,
                 ticker or "", company or "", sector, cat,
                 title, article_time, ko, url
             ]
-
             try:
-                app.logger.info(f"[sheets] try append GUID={guid} title={title[:60]}")
                 append_sheet(row)
-                app.logger.info("[sheets] ✅ append ok")
+                app.logger.info("[sheets] append ok")
             except Exception as e:
-                app.logger.error(f"[sheets] ❌ append failed: {e}")
+                app.logger.error(f"[sheets] append failed: {e}")
 
-    # ✅ 캐시/seen 저장
-    save_json_set(SEEN_FILE, seen)
     save_json_dict(SECTOR_CACHE_FILE, sector_cache)
     app.logger.info("🔎 run_once: done")
-
-
 
 # -------------------- 백그라운드 루프 --------------------
 stop_event = threading.Event()
@@ -372,7 +418,7 @@ def root():
 def healthz():
     return jsonify({"status":"ok","uptime_sec": int(time.time()-start_time)}), 200
 
-# ✅ 진단용 시트 테스트 엔드포인트
+# 진단용 시트 테스트
 @app.route("/_sheet_test")
 def sheet_test():
     try:
@@ -383,7 +429,6 @@ def sheet_test():
         app.logger.error(f"[sheets] manual test failed: {e}")
         return f"sheet append failed: {e}", 500
 
-
 def main():
     t = threading.Thread(target=scanner_loop, daemon=True)
     t.start()
@@ -393,9 +438,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 
