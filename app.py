@@ -1,13 +1,11 @@
 # app.py — Newswire Scanner (PRNewswire + GlobeNewswire)
-# - 35–50s jitter loop
-# - Keyword filtering
-# - GPT 한국어 요약 (영문 제거)
-# - Discord Webhook 푸시
-# - (옵션) Google Sheets 로그
-# - Sector 캐시 (yfinance)
-# - /healthz 헬스체크
-# - 중복 방지: Redis(권장) + 로컬 폴백
-# - 상세 로그
+# 하이브리드 키워드 필터(정확매칭 + 의미유사도) & "5대 카테고리 중 ≥3개 충족" 규칙 적용 버전
+# - RSS 수집
+# - 카테고리별 매칭(Phase2 전용 / Phase3 전용 / 공통 / 효과크기 / 비교우위성)
+# - 부정문(negation) 무효화
+# - 제목 가중치
+# - OpenAI 임베딩 사전계산 + 캐시
+# - 기존 기능(요약/Discord/GSheet/중복/헬스체크) 유지
 
 import os, re, time, json, hashlib, requests, feedparser, datetime, threading, random, logging, socket
 from zoneinfo import ZoneInfo
@@ -15,6 +13,7 @@ from urllib.parse import urlparse
 from openai import OpenAI
 from flask import Flask, jsonify
 import yfinance as yf
+import math
 
 # -------------------- 환경 변수 --------------------
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -32,66 +31,156 @@ app.logger.info(f"🧭 instance={INSTANCE} | use_redis={'yes' if REDIS_URL else 
 
 # -------------------- RSS 소스 --------------------
 RSS_FEEDS = [
-    "https://www.prnewswire.com/rss/news-releases-list.rss",  # PR Newswire 전체
+    "https://www.prnewswire.com/rss/news-releases-list.rss",
     "https://www.globenewswire.com/RssFeed/country/United%20States/feedTitle/GlobeNewswire%20-%20News%20from%20United%20States"
 ]
 
-# -------------------- 키워드 --------------------
-KEYWORDS = re.compile(r'''(?ix)\b(
-pilot\ project|proof[-\ ]of[-\ ]concept|\bPOC\b|pilot|proof-of-concept|kickoff|
-supply\ (agreement|contract|deal|order)|
-sales\ (agreement|contract)|purchase\ order|\bPO\b|
-new\ customer|selects|chooses|deploys|adopts|rollout\ with|goes\ live\ with|
-strategic\ partnership|partnership|collaboration|alliances|joint\ venture|\bJV\b|
-contract\ with|awarded\ by|awards\ contract|RFP\ award|\bDOI\b|US\ Army|USAF|Navy|municipality|county|state\ of|
-private\ placement|at[-\ ]the[-\ ]market\ private\ placement|equity\ financing|
-\bPIPE\b|private\ investment\ in\ public\ equity|
-registered\ direct\ offering|\bRDO\b|
-phase\ 1\b|phase\ 2\b|phase\ 3\b|clinical\ trial|trial\ results|FDA\ approval|BLA\ approval|NDA\ approval|clearance|
-grant|government\ grant|\bDOE\b|DoD\ grant|\bNSF\b|\bSBIR\b|\bARPA-E\b|\bNTIA\b|CHIPS\ Act|
-launches|introduces|announces\ new|releases|unveil\w*|debuts|rolls\ out|solution|
-\bELOC\b|equity\ line\ of\ credit|standby\ equity\ purchase|
-strategic\ investment|equity\ investment|takes\ stake|
-purchase\ agreement|asset\ purchase|stock\ purchase|
-license\ agreement|licensing\ agreement|licensing\ (deal|contract|partnership)|exclusive\ license|non[-\ ]exclusive\ license|license\ rights|licensing\ rights|
-share\ repurchase|buyback|repurchase\ program|authorization\ to\ repurchase|
-in\ discussions\ to\ acquire|exploring\ acquisition|preliminary\ discussions|
-enters\ into\ definitive\ agreement|merger\ agreement|acquisition\ agreement|
-land\ use\ permit|\bLUP\b|conditional\ use\ permit|\bCUP\b|zoning\ approval|
-federal\ funding|federal\ award|US\ federal|grant\ award|contract\ award)\b''')
+# -------------------- 하이브리드 필터 설정 --------------------
+# 임베딩 모델/임계값 등
+EMBEDDING_MODEL = "text-embedding-3-small"  # 속도/비용 최적
+SIM_THRESHOLD = 0.82                         # 의미 유사도 임계값(카테고리 대표문장 vs 기사)
+TITLE_BONUS = 0.02                           # 제목 가중: 타이트한 임계값 경계에서 밀어줌
+MAX_ARTICLE_LEN = 6000                       # 임베딩용 텍스트 최대 길이
 
-# 카테고리 라벨러(알림 제목에 사용)
-CATEGORIES = [
-  ("new_project", r"pilot project|proof[- ]of[- ]concept|\bPOC\b|pilot|proof-of-concept|kickoff"),
-  ("supply_agreement", r"supply (agreement|contract|deal|order)"),
-  ("sales_contract", r"sales (agreement|contract)|purchase order|\bPO\b"),
-  ("new_customer", r"new customer|selects|chooses|deploys|adopts|rollout with|goes live with"),
-  ("strategic_partnership", r"strategic partnership|partnership|collaboration|alliances|joint venture|\bJV\b"),
-  ("gov_public_contract", r"contract with|awarded by|awards contract|RFP award|\bDOI\b|US Army|USAF|Navy|municipality|county|state of"),
-  ("private_placement", r"private placement|at[- ]the[- ]market private placement|equity financing"),
-  ("pipe", r"\bPIPE\b|private investment in public equity"),
-  ("registered_direct", r"registered direct offering|\bRDO\b"),
-  ("clinical_result_or_approval", r"phase 1\b|phase 2\b|phase 3\b|clinical trial|trial results|FDA approval|BLA approval|NDA approval|clearance"),
-  ("gov_grant_or_policy_fund", r"grant|government grant|\bDOE\b|DoD grant|\bNSF\b|\bSBIR\b|\bARPA-E\b|\bNTIA\b|CHIPS Act"),
-  ("new_product_or_tech_announcement", r"launches|introduces|announces new|releases|unveil\w*|debuts|rolls out|solution"),
-  ("eloc", r"\bELOC\b|equity line of credit|standby equity purchase"),
-  ("equity_or_strategic_investment", r"strategic investment|equity investment|takes stake"),
-  ("purchase_agreement", r"purchase agreement|asset purchase|stock purchase"),
-  ("buyback", r"share repurchase|buyback|repurchase program|authorization to repurchase"),
-  ("mna_discussion", r"in discussions to acquire|exploring acquisition|preliminary discussions"),
-  ("mna_negotiation", r"enters into definitive agreement|merger agreement|acquisition agreement"),
-  ("land_use_permit", r"land use permit|\bLUP\b|conditional use permit|\bCUP\b|zoning approval"),
-  ("federal_funding", r"federal funding|federal award|US federal|grant award|contract award"),
-  ("license_agreement", r"license agreement|licensing agreement|licensing (deal|contract|partnership)|exclusive license|non[- ]exclusive license|license rights|licensing rights"),
+# 부정(negation) 패턴: 해당 문장에 있으면 긍정 키워드 무효화
+NEGATIONS = re.compile(r"""(?ix)
+    \b(did\s+not|does\s+not|do\s+not|has\s+not|have\s+not|failed\s+to|fail\s+to|no\s+evidence\s+of|
+       not\s+statistically\s+significant|did\s+not\s+meet|missed|without\s+meaningful\s+improvement)\b
+""")
+
+# 5개 대카테고리 정의(정확 매칭용 키워드 + 임베딩용 대표 문장 세트)
+PHASE2_ONLY = [
+    # 핵심 키워드/동의어/파생
+    r"end[- ]of[- ]phase 2 meeting (planned|completed|requested|initiated)",
+    r"end[- ]of[- ]phase 2 (discussion|meeting) (with|at)\s*fda",
+    r"phase 3 (planning|preparation) (initiated|underway)",
+    r"advancing to pivotal phase 3 (study|trial)",
+    r"design of phase 3 trial (finalized|completed)",
+    r"phase 3 protocol (under development|aligned with fda)",
+    r"dose[- ]ranging (study|results)",
+    r"dose[- ]optimization study (completed|conducted)",
+    r"proof[- ]of[- ]concept (established|demonstrated|confirmed)",
+    r"exploratory (endpoints|data) (achieved|support)",
+    r"(refining|identified) target patient population",
+    r"(optimization of|optimizing) dosing regimen",
+    r"bridging study planned (before|prior to) phase 3",
+    r"pivotal trial planning (underway|initiated)",
 ]
-def classify(text):
-    for label, pat in CATEGORIES:
-        if re.search(pat, text, re.I): return label
-    return "other"
+
+PHASE2_QUERIES = [
+    "end-of-Phase 2 meeting planned with FDA",
+    "advancing to a pivotal Phase 3 trial",
+    "dose-ranging results inform Phase 3 design",
+    "proof-of-concept established enabling late-stage development"
+]
+
+PHASE3_ONLY = [
+    r"(met|achieved|reached|satisfied)\s+the\s+primary\s+endpoint",
+    r"primary (objective|efficacy endpoint) (achieved|met)",
+    r"co[- ]primary endpoints (achieved|met)",
+    r"(achieved|met|exceeded)\s+(all\s+)?secondary endpoints",
+    r"(superiority|non[- ]inferiority)\s+(over|to)\s+(placebo|standard of care|soc|comparator|existing therapies?)",
+    r"pre[- ]nda meeting (planned|completed|held)",
+    r"\bnda (submission|filing) (expected|initiated|completed|filed|underway)",
+    r"rolling (submission|nda) (initiated|ongoing)",
+    r"\bbla submission planned\b",
+    r"pdufa date (announced|scheduled|set)",
+    r"fda (has )?accepted the nda (for review)?",
+    r"regulatory (review|submission) (underway|completed)",
+    r"(approval decision expected|marketing authorization application|label expansion planned)",
+    r"commercial launch preparation (underway|initiated)",
+    r"phase 4 post[- ]marketing study planned"
+]
+
+PHASE3_QUERIES = [
+    "met the primary endpoint in Phase 3",
+    "company plans to submit an NDA",
+    "FDA accepted the NDA and set a PDUFA date",
+    "results will form the basis of regulatory submission"
+]
+
+COMMON = [
+    # 효능
+    r"statistically significant( (improvement|reduction|results))?",
+    r"clinically meaningful (improvement|benefit|effect)",
+    r"robust (efficacy|clinical response)",
+    r"dose[- ]dependent response|dose[- ]response relationship",
+    r"(improved|enhanced)\s+(primary outcomes?|response rate|survival rate|pfs|orr|os|qol)",
+    r"(durable response|sustained efficacy)",
+    r"(consistent efficacy|efficacy maintained)",
+    # 안전성
+    r"no (drug|treatment)[- ]related (serious )?adverse events",
+    r"no serious safety signals|no unexpected safety concerns",
+    r"well tolerated|favorable tolerability profile|manageable safety profile",
+    r"safety profile consistent (with previous (trials|studies)|with prior studies|with standard of care)",
+    r"low discontinuation rate due to adverse events",
+    r"favorable (risk[- ]benefit|benefit[- ]risk) profile",
+    # 규제/전략
+    r"(engaging|dialogue|interactions) with (regulators|fda)",
+    r"regulatory (alignment|discussions|feedback) (achieved|incorporated|ongoing)",
+    r"findings support potential (regulatory )?approval",
+    r"data (will|to) form the basis of (an )?(nda|bla|submission)",
+    r"(addresses|addressing) an unmet medical need",
+    r"(first|best)[- ]in[- ]class (potential|profile)|potential to become standard of care",
+]
+
+COMMON_QUERIES = [
+    "statistically significant improvement with clinically meaningful benefit",
+    "well tolerated with no treatment-related serious adverse events",
+    "findings support potential regulatory approval and address unmet medical need"
+]
+
+EFFECT_SIZE = [
+    r"clinically meaningful (improvement|benefit|effect)",
+    r"(robust|strong|pronounced)\s+efficacy",
+    r"(marked|substantial)\s+improvement",
+    r"significant effect size|large effect size",
+    r"(durable response|sustained efficacy)",
+    r"high (response rate|orr|cr|pr)",
+    r"deep responses? observed|robust clinical response observed",
+    r"meaningful reduction in",
+    r"significant magnitude of response|substantial clinical impact",
+]
+
+EFFECT_SIZE_QUERIES = [
+    "clinically meaningful improvement and robust efficacy",
+    "substantial improvement with durable responses",
+    "high overall response rate and deep responses observed"
+]
+
+COMPARATIVE = [
+    r"superior (to|over)\s+(placebo|standard of care|soc|comparator|existing therapies?)",
+    r"significantly greater efficacy (vs|than)\s+comparator",
+    r"non[- ]inferior (to|versus)\s+\w+",
+    r"non[- ]inferior and numerically superior",
+    r"outperformed\s+\w+ (in|on)\s+(primary|secondary)\s+endpoints?",
+    r"higher response rate (vs|than)\s+(control|comparator)",
+    r"favorable efficacy profile compared (with|to) current therapies",
+    r"greater magnitude of effect compared (to|with)\s+(baseline|soc|comparator)",
+    r"superior benefit observed across endpoints|more effective than existing treatment options"
+]
+
+COMPARATIVE_QUERIES = [
+    "superior efficacy compared to standard of care",
+    "outperformed placebo across primary and secondary endpoints",
+    "non-inferior to comparator with higher response rate"
+]
+
+# 카테고리 컨테이너
+CATEGORIES = {
+    "phase2_only": {"regex": [re.compile(p, re.I) for p in PHASE2_ONLY], "queries": PHASE2_QUERIES},
+    "phase3_only": {"regex": [re.compile(p, re.I) for p in PHASE3_ONLY], "queries": PHASE3_QUERIES},
+    "common":      {"regex": [re.compile(p, re.I) for p in COMMON],      "queries": COMMON_QUERIES},
+    "effect_size": {"regex": [re.compile(p, re.I) for p in EFFECT_SIZE], "queries": EFFECT_SIZE_QUERIES},
+    "comparative": {"regex": [re.compile(p, re.I) for p in COMPARATIVE], "queries": COMPARATIVE_QUERIES},
+}
+
+REQUIRED_MIN_CATS = 3  # ≥3개 카테고리 충족해야 통과
 
 # -------------------- 파일 경로/지터 --------------------
 SEEN_FILE = "seen.json"
 SECTOR_CACHE_FILE = "sector_cache.json"
+EMBED_CACHE_FILE = "embed_cache.json"
 JITTER_MIN, JITTER_MAX = 35, 50
 
 # -------------------- 선택적: Google Sheets --------------------
@@ -214,7 +303,7 @@ def get_sector_with_cache(ticker, cache):
     cache[ticker] = sector
     return sector
 
-# -------------------- GPT 요약(→한국어) --------------------
+# -------------------- OpenAI 클라이언트/요약 --------------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 def summarize_ko(text):
     prompt = (
@@ -228,14 +317,126 @@ def summarize_ko(text):
     )
     return r.choices[0].message.content.strip()
 
+# -------------------- 임베딩(사전 계산 + 캐시) --------------------
+_embed_cache = load_json_dict(EMBED_CACHE_FILE)
+
+def _vec(text: str):
+    key = f"emb::{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
+    if key in _embed_cache: return _embed_cache[key]
+    r = client.embeddings.create(model=EMBEDDING_MODEL, input=[text])
+    v = r.data[0].embedding
+    _embed_cache[key] = v
+    # 주기적으로 저장
+    if random.random() < 0.05:
+        save_json_dict(EMBED_CACHE_FILE, _embed_cache)
+    return v
+
+def _cos(u, v):
+    # 두 벡터는 동일 모델 차원이라고 가정
+    num = sum(a*b for a,b in zip(u,v))
+    den = math.sqrt(sum(a*a for a in u))*math.sqrt(sum(b*b for b in v))
+    return num/den if den else 0.0
+
+# 카테고리 대표 쿼리 임베딩 사전 계산
+CATEGORY_QUERY_EMBEDS = {}
+def _warmup_category_queries():
+    for name, obj in CATEGORIES.items():
+        qemb = []
+        for q in obj["queries"]:
+            qemb.append(_vec(q))
+        CATEGORY_QUERY_EMBEDS[name] = qemb
+
+_warmup_category_queries()
+
+# -------------------- 하이브리드 매칭 로직 --------------------
+def _normalize(s: str) -> str:
+    s = (s or "")
+    # 임베딩 입력 길이 제한
+    return s[:MAX_ARTICLE_LEN]
+
+def _has_negation(sentence: str) -> bool:
+    return bool(NEGATIONS.search(sentence))
+
+def _exact_match_any(regex_list, text):
+    # 부정문 단위 처리를 위해 문장별 검사
+    # 간단한 문장 분할(마침표/느낌표/물음표 기준)
+    sentences = re.split(r'(?<=[\.\!\?])\s+', text)
+    for sent in sentences:
+        if _has_negation(sent):
+            continue
+        for pat in regex_list:
+            if pat.search(sent):
+                return True
+    return False
+
+def _semantic_match(name: str, title: str, body: str) -> bool:
+    # 제목/본문 임베딩 한 번씩
+    t = _normalize(title)
+    b = _normalize(body)
+    tvec = _vec(t) if t else None
+    bvec = _vec(b) if b else None
+    qvecs = CATEGORY_QUERY_EMBEDS.get(name, [])
+    if not qvecs: return False
+
+    # 제목 가중치: 제목 유사도에 TITLE_BONUS 추가
+    def _max_sim(doc_vec):
+        if not doc_vec: return 0.0
+        sims = [_cos(doc_vec, qv) for qv in qvecs]
+        return max(sims) if sims else 0.0
+
+    sim_title = _max_sim(tvec)
+    sim_body  = _max_sim(bvec)
+
+    # 부정문이 전체 텍스트에 강하게 깔리면 임계 상향
+    neg_penalty = 0.0
+    if NEGATIONS.search(title) or NEGATIONS.search(body):
+        neg_penalty = 0.02
+
+    # 임계 판단
+    if sim_title + TITLE_BONUS - neg_penalty >= SIM_THRESHOLD:
+        return True
+    if sim_body - neg_penalty >= SIM_THRESHOLD:
+        return True
+    return False
+
+def match_categories(title: str, summary: str):
+    """
+    반환: (matched_labels: list[str], debug_scores: dict)
+    - 각 카테고리는 '정확매칭 OR 의미매칭'이면 충족
+    - 부정문은 정확매칭 단계에서 무효화
+    """
+    text = f"{title} {summary}".strip()
+    matched = []
+    dbg = {}
+    for name, obj in CATEGORIES.items():
+        exact_ok = _exact_match_any(obj["regex"], text)
+        sem_ok   = _semantic_match(name, title, summary)
+        ok = exact_ok or sem_ok
+        dbg[name] = {"exact": exact_ok, "semantic": sem_ok}
+        if ok:
+            matched.append(name)
+    return matched, dbg
+
 # -------------------- Discord --------------------
-def discord_embed(category, title, url, ticker, company, sector, article_time, summary_ko):
+def discord_embed(category_labels, title, url, ticker, company, sector, article_time, summary_ko, dbg=None):
+    cat_line = " | ".join(category_labels) if category_labels else "unclassified"
+    desc = f"{summary_ko}\n\n"
+    if dbg:
+        try:
+            # 간단 디버그(선택): 어떤 방식으로 매칭됐는지 표시
+            bits = []
+            for k,v in dbg.items():
+                bits.append(f"{k}:E={'1' if v['exact'] else '0'}/S={'1' if v['semantic'] else '0'}")
+            desc += "🧠 match: " + ", ".join(bits) + "\n\n"
+        except Exception:
+            pass
+    desc += f"🔗 원문: {url}"
     return {
         "username": "Newswire Scanner",
         "embeds": [{
-            "title": f"[{category}] {title}",
+            "title": f"[{cat_line}] {title}",
             "url": url,
-            "description": f"{summary_ko}\n\n🔗 원문: {url}",
+            "description": desc,
             "fields": [
                 {"name":"Company","value": company or "N/A", "inline": True},
                 {"name":"Ticker","value": ticker or "N/A", "inline": True},
@@ -256,7 +457,7 @@ def push_discord(payload):
 
 # -------------------- Dedup Store (Redis or local) --------------------
 try:
-    import redis  # render의 이미지에 없으면 ImportError → 자동 폴백
+    import redis
 except Exception:
     redis = None
 
@@ -278,34 +479,26 @@ def _get_redis():
 
 def _normalize_title(title: str) -> str:
     t = (title or "").lower()
-    t = re.sub(r"[\W_]+", " ", t)     # 특수문자 제거
+    t = re.sub(r"[\W_]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 def seen_check_and_set_url(guid: str, ttl_seconds: int = 14*24*3600) -> bool:
-    """
-    URL GUID 기준 체크. True → 이미 봄 / False → 처음 봄(마킹 성공)
-    """
     r = _get_redis()
     if r:
         key = f"nwscanner:seen:url:{guid}"
         try:
-            ok = r.setnx(key, INSTANCE)  # race-free
+            ok = r.setnx(key, INSTANCE)
             if ok: r.expire(key, ttl_seconds)
             return not ok
         except Exception as e:
             app.logger.error(f"[dedup] Redis error(url): {e}")
-    # 폴백: 로컬 파일 세트
     seen = load_json_set(SEEN_FILE)
     if guid in seen: return True
     seen.add(guid); save_json_set(SEEN_FILE, seen)
     return False
 
 def seen_set_title_once(title: str, ttl_seconds: int = 14*24*3600) -> bool:
-    """
-    제목 기반 보조 차단. 이미 있으면 True, 없으면 set 후 False.
-    (URL이 달라도 같은 제목이면 차단)
-    """
     norm = _normalize_title(title)
     if not norm: return False
     r = _get_redis()
@@ -318,7 +511,6 @@ def seen_set_title_once(title: str, ttl_seconds: int = 14*24*3600) -> bool:
         except Exception as e:
             app.logger.error(f"[dedup] Redis error(title): {e}")
             return False
-    # 로컬 폴백은 URL 세트와 충돌 우려로 생략 (Redis 권장)
     return False
 
 # -------------------- 스캔 1회 --------------------
@@ -341,7 +533,7 @@ def run_once():
             clean = clean_url(url)
             guid = hashlib.sha256(clean.encode()).hexdigest()[:16]
 
-            # ✅ 1차: URL 기준 중앙 중복 차단 (즉시)
+            # 1) URL 기반 중복 차단
             if seen_check_and_set_url(guid):
                 app.logger.info(f"⏩ already seen(url): {guid}")
                 continue
@@ -350,21 +542,22 @@ def run_once():
             summary = getattr(e, "summary", "") or ""
             hay = f"{title} {summary}"
 
-            if not KEYWORDS.search(hay):
-                app.logger.info(f"❌ no match: {title[:100]}...")
+            # 2) 하이브리드 매칭 + "≥3 카테고리" 규칙
+            matched_labels, dbg = match_categories(title, summary)
+            if len(matched_labels) < REQUIRED_MIN_CATS:
+                app.logger.info(f"❌ <{REQUIRED_MIN_CATS} categories: {title[:100]}...")
                 continue
 
-            # ✅ 2차: 제목 기반 보조 차단 (서로 다른 URL이라도 같은 기사면 차단)
+            # 3) 제목 기반 보조 중복 차단
             if seen_set_title_once(title):
                 app.logger.info(f"⏩ already seen(title): {title[:80]}…")
                 continue
 
-            app.logger.info(f"✅ MATCH: {title[:120]}...")
+            app.logger.info(f"✅ MATCH({len(matched_labels)} cats): {title[:120]}... — {matched_labels}")
 
             article_time = ny_kst_label(
                 getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
             )
-            cat = classify(hay)
             ticker = extract_ticker(hay)
             company = extract_company(title) or extract_company(summary)
             sector = get_sector_with_cache(ticker, sector_cache)
@@ -375,14 +568,14 @@ def run_once():
                 ko = "(요약 실패) " + (summary[:200] or title)
                 app.logger.error(f"[gpt] error: {ex}")
 
-            payload = discord_embed(cat, title, url, ticker, company, sector, article_time, ko)
+            payload = discord_embed(matched_labels, title, url, ticker, company, sector, article_time, ko, dbg)
             push_discord(payload)
             app.logger.info("📤 pushed to Discord")
 
             # Google Sheets 기록
             row = [
                 now_kst, feed_url.split('/')[2], guid,
-                ticker or "", company or "", sector, cat,
+                ticker or "", company or "", sector, "|".join(matched_labels),
                 title, article_time, ko, url
             ]
             try:
@@ -391,6 +584,7 @@ def run_once():
             except Exception as e:
                 app.logger.error(f"[sheets] append failed: {e}")
 
+    save_json_dict(EMBED_CACHE_FILE, _embed_cache)
     save_json_dict(SECTOR_CACHE_FILE, sector_cache)
     app.logger.info("🔎 run_once: done")
 
@@ -418,7 +612,6 @@ def root():
 def healthz():
     return jsonify({"status":"ok","uptime_sec": int(time.time()-start_time)}), 200
 
-# 진단용 시트 테스트
 @app.route("/_sheet_test")
 def sheet_test():
     try:
