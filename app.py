@@ -268,6 +268,7 @@ def push_discord(payload):
         app.logger.error(f"[discord] push error: {e}")
 
 # -------------------- 스캔 1회 --------------------
+# -------------------- 스캔 1회 --------------------
 def run_once():
     app.logger.info("🔎 run_once: start")
     seen = load_json_set(SEEN_FILE)
@@ -282,14 +283,16 @@ def run_once():
         for e in feed.entries[:80]:
             url = getattr(e, "link", "") or ""
             if not url:
+                app.logger.info("⚠️  entry skipped: no URL")
                 continue
 
-            # URL 정규화 후 GUID 생성
+            # ✅ URL 정규화 후 GUID 생성
             guid = hashlib.sha256(clean_url(url).encode()).hexdigest()[:16]
             if guid in seen:
+                app.logger.info(f"⏩ already seen: {guid}")
                 continue
 
-            # 먼저 본 것으로 표시(중복 방지) + 즉시 저장
+            # ✅ 중복 방지: 가장 먼저 등록
             seen.add(guid)
             save_json_set(SEEN_FILE, seen)
 
@@ -297,8 +300,9 @@ def run_once():
             summary = getattr(e, "summary", "") or ""
             hay = f"{title} {summary}"
 
-            # 키워드 매칭 실패 시 스킵
+            # ✅ 키워드 매칭 실패 로그
             if not KEYWORDS.search(hay):
+                app.logger.info(f"❌ no match: {title[:100]}...")
                 continue
 
             app.logger.info(f"✅ MATCH: {title[:120]}...")
@@ -311,28 +315,37 @@ def run_once():
             company = extract_company(title) or extract_company(summary)
             sector = get_sector_with_cache(ticker, sector_cache)
 
+            # ✅ GPT 요약
             try:
                 ko = summarize_ko(summary if summary else title)
             except Exception as ex:
                 ko = "(요약 실패) " + (summary[:200] or title)
                 app.logger.error(f"[gpt] error: {ex}")
 
+            # ✅ 디스코드 전송
             payload = discord_embed(cat, title, url, ticker, company, sector, article_time, ko)
             push_discord(payload)
             app.logger.info("📤 pushed to Discord")
 
-            # 시트 기록(옵션)
+            # ✅ Google Sheets 기록 (강화된 로깅)
             row = [
                 now_kst, feed_url.split('/')[2], guid,
                 ticker or "", company or "", sector, cat,
                 title, article_time, ko, url
             ]
-            append_sheet(row)
-            app.logger.info("🧾 appended to Sheet (if enabled)")
 
+            try:
+                app.logger.info(f"[sheets] try append GUID={guid} title={title[:60]}")
+                append_sheet(row)
+                app.logger.info("[sheets] ✅ append ok")
+            except Exception as e:
+                app.logger.error(f"[sheets] ❌ append failed: {e}")
+
+    # ✅ 캐시/seen 저장
     save_json_set(SEEN_FILE, seen)
     save_json_dict(SECTOR_CACHE_FILE, sector_cache)
     app.logger.info("🔎 run_once: done")
+
 
 
 # -------------------- 백그라운드 루프 --------------------
@@ -380,6 +393,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
