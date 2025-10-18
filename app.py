@@ -316,6 +316,59 @@ def fetch_body_text(url: str, timeout=12) -> str:
     except Exception:
         return ""
 
+
+# -------------------- ORIGIN / LICENSE HELPERS --------------------
+COUNTRY_MAP = {
+    "Roche": "Switzerland",
+    "Novartis": "Switzerland",
+    "Kyowa Kirin": "Japan",
+    "Suzhou Kintor": "China",
+    "Kintor": "China",
+    "Vor Bio": "United States",
+    "Climb Bio": "United States",
+    "Roivant": "United States",
+    "Priovant": "United States",
+}
+COUNTRY_FLAG = {
+    "United States": "🇺🇸", "Switzerland": "🇨🇭", "Japan": "🇯🇵", "China": "🇨🇳",
+    "United Kingdom": "🇬🇧", "France": "🇫🇷", "Germany": "🇩🇪", "Korea": "🇰🇷",
+    "South Korea": "🇰🇷", "Canada": "🇨🇦", "Australia": "🇦🇺",
+}
+COUNTRY_REGEX = re.compile(r"(?i)\b(United States|U\.S\.|USA|Switzerland|Japan|China|United Kingdom|UK|France|Germany|Korea|South Korea|Canada|Australia)\b")
+CITY_COUNTRY_HINTS = {
+    "Basel": "Switzerland", "Basle": "Switzerland", "Tokyo": "Japan", "Osaka": "Japan",
+    "Shanghai": "China", "Beijing": "China", "Shenzhen": "China",
+    "Boston": "United States", "New York": "United States", "San Francisco": "United States",
+    "Cambridge": "United Kingdom", "London": "United Kingdom", "Paris": "France", "Berlin": "Germany",
+    "Seoul": "South Korea", "Toronto": "Canada", "Sydney": "Australia",
+}
+def country_flag(country: str) -> str:
+    return COUNTRY_FLAG.get(country, "")
+def detect_company_origin(company: str, text_blob: str) -> str | None:
+    if company and company in COUNTRY_MAP:
+        c = COUNTRY_MAP[company]; return f"{country_flag(c)} {c}".strip()
+    m = COUNTRY_REGEX.search(text_blob or "")
+    if m:
+        val = m.group(1); norm = {"U.S.": "United States", "USA": "United States", "UK": "United Kingdom"}.get(val, val)
+        return f"{country_flag(norm)} {norm}".strip()
+    for city, co in CITY_COUNTRY_HINTS.items():
+        if re.search(rf"(?i)\b{re.escape(city)}\b", text_blob or ""): return f"{country_flag(co)} {co}".strip()
+    return None
+LICENSE_REGEX = re.compile(r"""(?ix)
+    (?P<seller>[A-Z][A-Za-z0-9&\-\s]+)\s+(?:has\s+)?licensed\s+(?:out\s+)?(?P<asset>[A-Za-z0-9\-\s]+?)\s+to\s+(?P<buyer>[A-Z][A-Za-z0-9&\-\s]+)
+  | (?P<buyer2>[A-Z][A-Za-z0-9&\-\s]+)\s+(?:has\s+)?licensed\s+(?:in\s+)?(?P<asset2>[A-Za-z0-9\-\s]+?)\s+from\s+(?P<seller2>[A-Z][A-Za-z0-9&\-\s]+)
+  | (entered\s+into\s+an?\s+exclusive\s+licensing\s+agreement\s+with\s+(?P<partner>[A-Z][A-Za-z0-9&\-\s]+))
+""")
+def extract_licensing_info(text_blob: str) -> str | None:
+    m = LICENSE_REGEX.search(text_blob or "")
+    if not m: return None
+    if m.groupdict().get('seller') and m.groupdict().get('buyer'):
+        return f"Licensed out {m.group('asset').strip()} to {m.group('buyer').strip()}"
+    if m.groupdict().get('buyer2') and m.groupdict().get('seller2'):
+        return f"Licensed from {m.group('seller2').strip()}"
+    if m.groupdict().get('partner'):
+        return f"Exclusive licensing agreement with {m.group('partner').strip()}"
+    return None
 # -------------------- TICKER/COMPANY/SECTOR --------------------
 TICKER_PATTERNS = [
     r"\b(?:NASDAQ|Nasdaq|NYSE|AMEX|OTC|TSX|ASX|HKEX):\s*([A-Z]{1,5})\b",
@@ -326,21 +379,67 @@ TICKER_PATTERNS = [
     r"\b([A-Z]{2,5})\b"
 ]
 def extract_ticker(text):
-    for pat in TICKER_PATTERNS[:-1]:
-        m = re.search(pat, text)
-        if m: return m.group(1)
-    m = re.search(TICKER_PATTERNS[-1], text)
-    if m:
-        cand = m.group(1)
-        if cand.isalpha() and 2 <= len(cand) <= 5:
-            return cand
-    return None
+    """
+    Try to detect exchange + symbol from a variety of formats.
+    Returns (exchange, symbol) where exchange may be None.
+    Supported:
+      - "EXCHANGE: SYMBOL"  (e.g., NASDAQ: RIVN, EPA: SAN, LSE: AZN)
+      - "$SYMB"             (e.g., $AZN)
+      - "(SYMB)" or "[SYMB]"
+      - "TICKER: SYMB"
+      - Yahoo/Bloomberg-ish: "SAN.PA", "AZN.L", "BNTX.F", "ROG.SW", "005930.KS", "068270.KQ"
+    """
+    text = text or ""
 
-COMPANY_PATTERNS = [
-    r"^(.+?)\s*\((?:NASDAQ|Nasdaq|NYSE|AMEX|OTC|TSX|ASX|HKEX):\s*[A-Z]{1,5}\)\s",
-    r"^(.+?)\s+(?:Announces|Launches|Introduces|Signs|Enters|Reports|Unveils|Debuts)\b",
-    r"^(.+?)\s+(?:Wins|Receives|Secures|Partners|Collaborates|Expands)\b"
-]
+    # 1) Explicit "EXCHANGE: SYMBOL"
+    m = re.search(
+        r"\b("
+        r"NASDAQ|Nasdaq|NYSE|AMEX|OTC|TSX|ASX|HKEX|SIX|SWX|TSE|JPX|"
+        r"LSE|FWB|Euronext|EPA|AMS|EBR|ELI|BIT|BME|VIE|WSE|OSE|OMX|"
+        r"KRX|KOSDAQ|SSE|SZSE|BSE|NSE|TASE|JSE|BMV|B3|SGX"
+        r"):\s*([A-Z0-9\.\-]{1,10})\b",
+        text
+    )
+    if m:
+        exch = m.group(1).upper()
+        if exch == "SWX":
+            exch = "SIX"  # unify Swiss
+        if exch == "NASDAQ":
+            exch = "NASDAQ"
+        return (exch, m.group(2))
+
+    # 2) Yahoo/Bloomberg-style "SYMB.SUFFIX"
+    yahoo_map = {
+        "PA": "EPA", "SA": "B3", "MC": "BME", "MI": "BIT", "BR": "EBR",
+        "AS": "AMS", "LS": "ELI", "L": "LSE", "SW": "SIX", "VX": "SIX",
+        "F": "FWB", "DE": "FWB", "BE": "FWB", "MU": "FWB", "HA": "FWB",
+        "KS": "KRX", "KQ": "KOSDAQ", "HK": "HKEX", "SS": "SSE", "SZ": "SZSE",
+        "SI": "SGX", "TO": "TSX", "AX": "ASX", "JP": "TSE",
+    }
+    m = re.search(r"\b([A-Z0-9]{1,10})\.([A-Z]{1,3})\b", text)
+    if m:
+        sym, suf = m.group(1), m.group(2).upper()
+        exch = yahoo_map.get(suf)
+        if exch:
+            return (exch, sym)
+
+    # 3) $SYMB
+    m = re.search(r"\$\b([A-Z]{1,6})\b", text)
+    if m:
+        return (None, m.group(1))
+
+    # 4) (SYMB) or [SYMB]
+    m = re.search(r"[\(\[]([A-Z]{1,6})[\)\]]", text)
+    if m:
+        return (None, m.group(1))
+
+    # 5) "TICKER: SYMB"
+    m = re.search(r"\bTICKER:\s*([A-Z0-9\.]{1,10})\b", text)
+    if m:
+        return (None, m.group(1))
+
+    return (None, None)
+
 def extract_company(text):
     for pat in COMPANY_PATTERNS:
         m = re.search(pat, text, flags=re.I)
@@ -624,30 +723,51 @@ def run_once():
             has_safety = ("safety" in matched_labels) or bool(SAFETY_REGEX.search(hay_for_safety))
             safety_line = "🩺 Safety Mention: " + ("✅ 포함됨" if has_safety else "❌ 언급 없음")
 
+            
+            # Build origin & licensing
+            origin = detect_company_origin(company, hay)
+            licensing_info = extract_licensing_info(hay)
+
+            # Ticker display with exchange
+            exch, sym = extract_ticker(hay)
+            ticker_display = f"{exch}: {sym}" if exch and sym else (sym or ticker or "N/A")
+
+            # Description
+            desc_lines = []
+            desc_lines.append(f"🧩 Matched Categories: {cat_line}")
+            if origin: desc_lines.append(f"🌍 Company Origin: {origin}")
+            desc_lines.append(safety_line)
+            desc_lines.append("")
+            desc_lines.append(ko)
+            desc_lines.append("")
+            desc_lines.append(f"🔗 원문: {url}")
+            new_description = "\n".join(desc_lines)
+
+            fields = [
+                {"name":"Company","value": company or "N/A", "inline": True},
+                {"name":"Ticker","value": ticker_display, "inline": True},
+                {"name":"Sector","value": sector, "inline": True},
+            ]
+            if licensing_info:
+                fields.append({"name":"Licensing","value": licensing_info, "inline": True})
+            fields.extend([
+                {"name":"Matched Categories (detail)","value": matched_list_bullets, "inline": False},
+                {"name":"Safety Mention","value": "✅ 있음" if has_safety else "❌ 없음", "inline": True},
+                {"name":"Article Time","value": article_time, "inline": False},
+            ])
+
             payload = {
                 "username": "Newswire Scanner",
                 "embeds": [{
                     "title": f"[{cat_line}] {title}",
                     "url": url,
-                    "description": (
-                        f"🧩 Matched Categories: {cat_line}\n\n"
-                        f"{ko}\n\n"
-                        f"{safety_line}\n\n"
-                        "🧠 match: " + ", ".join(match_lines) +
-                        f"\n\n🔗 원문: {url}"
-                    ),
-                    "fields": [
-                        {"name":"Company","value": company or "N/A", "inline": True},
-                        {"name":"Ticker","value": ticker or "N/A", "inline": True},
-                        {"name":"Sector","value": sector, "inline": True},
-                        {"name":"Matched Categories (detail)","value": matched_list_bullets, "inline": False},
-                        {"name":"Safety Mention","value": "✅ 있음" if has_safety else "❌ 없음", "inline": True},
-                        {"name":"Article Time","value": article_time, "inline": False},
-                    ],
+                    "description": new_description,
+                    "fields": fields,
                     "footer": {"text":"Source: Multiple RSS"}
                 }]
             }
             push_discord(payload)
+
 
             # --- [PATCH END] ---
             row = [
