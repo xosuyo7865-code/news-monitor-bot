@@ -650,7 +650,7 @@ def run_once():
             push_discord(payload)
 
             # --- [PATCH END] ---
-row = [
+            row = [
                 now_kst, feed_url.split('/')[2], guid,
                 ticker or "", company or "", sector, "|".join(matched_labels),
                 title, article_time, ko, url
