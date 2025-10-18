@@ -235,7 +235,30 @@ COMPARATIVE_QUERIES = [
     "disease-modifying potential and a new standard of care"
 ]
 
+
+SAFETY_ONLY = [
+    r"(no|not)\s+(drug|treatment)[- ]related\s+(serious\s+)?adverse\s+events",
+    r"no\s+serious\s+safety\s+signals",
+    r"no\s+unexpected\s+safety\s+concerns",
+    r"(well|generally)\s+tolerated",
+    r"(favorable|acceptable|manageable)\s+(tolerability|safety)\s+profile",
+    r"safety(\s+and\s+tolerability)?\s+(profile\s+)?(consistent|aligned|similar|in\s+line)\s+with\s+(prior|previous|earlier|past)\s+(trials?|studies?|data)",
+    r"low\s+discontinuation\s+rate\s+due\s+to\s+adverse\s+events",
+    r"no\s+dose[- ]limiting\s+toxicities",
+    r"safety\s+data\s+support(s)?\s+(progression|continued\s+development|regulatory\s+submission)",
+]
+SAFETY_QUERIES = [
+    "well tolerated across all doses",
+    "no treatment-related serious adverse events reported",
+    "no unexpected safety concerns identified",
+    "safety and tolerability consistent with prior studies",
+    "safety profile consistent with previous trials",
+    "favorable tolerability profile with low discontinuation due to AEs",
+    "no dose-limiting toxicities observed",
+    "overall safety profile supports continued development and regulatory submission"
+]
 CATEGORIES = {
+    "safety": {"regex": [re.compile(p, re.I) for p in SAFETY_ONLY], "queries": SAFETY_QUERIES},
     "phase2_only": {"regex": [re.compile(p, re.I) for p in PHASE2_ONLY], "queries": PHASE2_QUERIES},
     "phase3_only": {"regex": [re.compile(p, re.I) for p in PHASE3_ONLY], "queries": PHASE3_QUERIES},
     "common":      {"regex": [re.compile(p, re.I) for p in COMMON],      "queries": COMMON_QUERIES},
@@ -598,7 +621,7 @@ def run_once():
 
             # Safety mention detection from available article text
             hay_for_safety = (text_for_match or "") + " " + (title or "") + " " + (summary or "")
-            has_safety = bool(SAFETY_REGEX.search(hay_for_safety))
+            has_safety = ("safety" in matched_labels) or bool(SAFETY_REGEX.search(hay_for_safety))
             safety_line = "🩺 Safety Mention: " + ("✅ 포함됨" if has_safety else "❌ 언급 없음")
 
             payload = {
