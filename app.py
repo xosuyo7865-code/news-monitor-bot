@@ -182,7 +182,7 @@ COMMON_QUERIES = [
 
 
 # -------------------- SAFETY DETECTION (for push flag) --------------------
-SAFETY_REGEX = re.compile(r\"\"\"(?ix)
+SAFETY_REGEX = re.compile(r"""(?ix)
  (no\s+(drug|treatment)[- ]related\s+(serious\s+)?adverse\s+events?)
  |no\s+serious\s+safety\s+signals?
  |no\s+unexpected\s+safety\s+concerns?
@@ -191,7 +191,7 @@ SAFETY_REGEX = re.compile(r\"\"\"(?ix)
  |manageable\s+safety\s+profile
  |safety\s+profile\s+consistent(\s+with\s+previous\s+(trials|studies))?
  |low\s+discontinuation\s+rate\s+due\s+to\s+adverse\s+events?
-)\"\"\")
+)""")
 EFFECT_SIZE = [
     r"clinically meaningful (improvement|benefit|effect)",
     r"(robust|strong|pronounced)\s+efficacy",
