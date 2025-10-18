@@ -179,6 +179,19 @@ COMMON_QUERIES = [
     "findings support potential regulatory approval and address unmet medical need"
 ]
 
+
+
+# -------------------- SAFETY DETECTION (for push flag) --------------------
+SAFETY_REGEX = re.compile(r\"\"\"(?ix)
+ (no\s+(drug|treatment)[- ]related\s+(serious\s+)?adverse\s+events?)
+ |no\s+serious\s+safety\s+signals?
+ |no\s+unexpected\s+safety\s+concerns?
+ |well\s+tolerated
+ |favorable\s+tolerability\s+profile
+ |manageable\s+safety\s+profile
+ |safety\s+profile\s+consistent(\s+with\s+previous\s+(trials|studies))?
+ |low\s+discontinuation\s+rate\s+due\s+to\s+adverse\s+events?
+)\"\"\")
 EFFECT_SIZE = [
     r"clinically meaningful (improvement|benefit|effect)",
     r"(robust|strong|pronounced)\s+efficacy",
@@ -569,16 +582,43 @@ def run_once():
                 ko = "(요약 실패) " + (summary[:200] or title)
                 app.logger.error(f"[gpt] error: {ex}")
 
+            # --- [PATCH START] Enhanced payload with matched categories & E/S hits + Safety flag ---
+
+            # Build readable E/S + hit list per category
+            match_lines = []
+            for k, v in dbg.items():
+                e = '1' if v['exact'] else '0'
+                s = '1' if v['semantic'] else '0'
+                hit = '✅' if k in matched_labels else '❌'
+                match_lines.append(f"{k}:E={e}/S={s}{hit}")
+
+            # Human-friendly category line and bulleted list
+            cat_line = " | ".join(matched_labels) if matched_labels else "unclassified"
+            matched_list_bullets = "• " + "\n• ".join(matched_labels) if matched_labels else "• (none)"
+
+            # Safety mention detection from available article text
+            hay_for_safety = (text_for_match or "") + " " + (title or "") + " " + (summary or "")
+            has_safety = bool(SAFETY_REGEX.search(hay_for_safety))
+            safety_line = "🩺 Safety Mention: " + ("✅ 포함됨" if has_safety else "❌ 언급 없음")
+
             payload = {
                 "username": "Newswire Scanner",
                 "embeds": [{
-                    "title": f"[{' | '.join(matched_labels)}] {title}",
+                    "title": f"[{cat_line}] {title}",
                     "url": url,
-                    "description": f"{ko}\n\n🧠 match: " + ", ".join([f"{k}:E={'1' if v['exact'] else '0'}/S={'1' if v['semantic'] else '0'}" for k,v in dbg.items()]) + f"\n\n🔗 원문: {url}",
+                    "description": (
+                        f"🧩 Matched Categories: {cat_line}\n\n"
+                        f"{ko}\n\n"
+                        f"{safety_line}\n\n"
+                        "🧠 match: " + ", ".join(match_lines) +
+                        f"\n\n🔗 원문: {url}"
+                    ),
                     "fields": [
                         {"name":"Company","value": company or "N/A", "inline": True},
                         {"name":"Ticker","value": ticker or "N/A", "inline": True},
                         {"name":"Sector","value": sector, "inline": True},
+                        {"name":"Matched Categories (detail)","value": matched_list_bullets, "inline": False},
+                        {"name":"Safety Mention","value": "✅ 있음" if has_safety else "❌ 없음", "inline": True},
                         {"name":"Article Time","value": article_time, "inline": False},
                     ],
                     "footer": {"text":"Source: Multiple RSS"}
@@ -586,7 +626,8 @@ def run_once():
             }
             push_discord(payload)
 
-            row = [
+            # --- [PATCH END] ---
+row = [
                 now_kst, feed_url.split('/')[2], guid,
                 ticker or "", company or "", sector, "|".join(matched_labels),
                 title, article_time, ko, url
